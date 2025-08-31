@@ -1,0 +1,6 @@
+name = "crypto-alarm"      # worker 名称，可自定义
+main = "src/index.js"
+compatibility_date = "2024-08-31"
+
+[env.production.vars]
+WECOM_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx"
