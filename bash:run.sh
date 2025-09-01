@@ -29,7 +29,7 @@ pip install "ccxt>=4.0.0" requests
 
 # 5) 环境变量（按需修改）
 # 企业微信机器人 Webhook（已按你的要求固定）
-export WECOM_WEBHOOK_URL="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b016a7cb-9979-4a1e-aff2-83c51d26384b"
+export WECOM_WEBHOOK_URL=""
 
 # Telegram（如无需 Telegram 推送可留空）
 # export TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
