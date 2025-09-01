@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub Actions 终极版
+GitHub Actions 终极版（pandas-ta 版，无需 TA-Lib）
 保留原始播报格式，末尾追加「建议 + 理由」
 """
 import os
@@ -9,8 +9,8 @@ import json
 import logging
 import requests
 import pandas as pd
+import pandas_ta as ta
 import ccxt
-import talib
 import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -52,12 +52,11 @@ def send(msg):
 
 # ---------- 技术指标 ----------
 def rsi(close, period=14):
-    return talib.RSI(np.array(close, dtype='float64'), timeperiod=period)[-1]
+    return float(pd.Series(close).ta.rsi(length=period).iloc[-1])
 
 def macd(close):
-    macd, signal, _ = talib.MACD(np.array(close, dtype='float64'),
-                                 fastperiod=12, slowperiod=26, signalperiod=9)
-    return macd[-1], signal[-1]
+    df = pd.Series(close).ta.macd()
+    return float(df["MACD_12_26_9"].iloc[-1]), float(df["MACDs_12_26_9"].iloc[-1])
 
 def fmt(num):
     return f"{int(num):,}"
@@ -72,13 +71,10 @@ def run_once():
 
     # 全局附加数据
     try:
-        premium = future_exchange.fapiPublicGetPremiumIndex()
-        funding_map = {d['symbol']: float(d['lastFundingRate']) for d in premium}
-        ls_data = future_exchange.fapiPublic_get_futures_data_topLongShortPositionRatio(
-            {'symbol': 'BTCUSDT', 'period': '5m'})
-        long_ratio = float(ls_data[-1]['longAccount']) if ls_data else 0.5
+        premiums = future_exchange.fapiPublicGetPremiumIndex()
+        funding_map = {d['symbol']: float(d['lastFundingRate']) for d in premiums}
     except Exception:
-        funding_map, long_ratio = {}, 0.5
+        funding_map = {}
 
     for sym in symbols:
         try:
@@ -101,7 +97,7 @@ def run_once():
                     pct = (price - prev_price) / prev_price * 100
                     if vol1m >= 50000 and abs(pct) >= 2:
                         advice, reasons = _advice_and_reasons(
-                            pct, vol1m, funding_map, long_ratio, price, sym)
+                            pct, vol1m, funding_map, price, spot_sym)
                         msg = (f"警报：{spot_sym}\n"
                                f"类型：现货放量\n"
                                f"数据：1 分钟成交额: ${fmt(vol1m)}, 价格波动: {pct:.2f}%\n"
@@ -121,7 +117,7 @@ def run_once():
                 delta = (oi - prev_oi) / prev_oi * 100
                 if abs(delta) >= 5:
                     advice, reasons = _advice_and_reasons(
-                        delta, oi, funding_map, long_ratio, price, sym)
+                        delta, oi, funding_map, price, sym)
                     msg = (f"警报：{sym}\n"
                            f"类型：期货{'加仓' if delta>0 else '减仓'}\n"
                            f"数据：持仓增加: {delta:.2f}%, 当前持仓: {fmt(oi)}\n"
@@ -135,7 +131,7 @@ def run_once():
     save_cache(cache)
 
 # ---------- 评分 ----------
-def _advice_and_reasons(pct, vol_or_oi, funding_map, long_ratio, price, sym):
+def _advice_and_reasons(change, amount, funding_map, price, sym):
     reasons = []
     score = 0
 
@@ -148,12 +144,12 @@ def _advice_and_reasons(pct, vol_or_oi, funding_map, long_ratio, price, sym):
         score -= 25
         reasons.append(f"费率多头 {rate:.2f}%")
 
-    # kline 5min 20 根做 RSI & MACD
+    # 技术指标
     try:
         k = spot_exchange.fetch_ohlcv(f"{sym.split('/')[0]}/USDT", '5m', limit=20)
         close = [float(x[4]) for x in k]
-        rsi14 = talib.RSI(np.array(close))[ -1 ]
-        macd_val, macd_sig = talib.MACD(np.array(close))[-1][:2]
+        rsi14 = rsi(close)
+        macd_val, macd_sig = macd(close)
 
         if rsi14 <= 30:
             score += 20
@@ -166,16 +162,8 @@ def _advice_and_reasons(pct, vol_or_oi, funding_map, long_ratio, price, sym):
             score += 10
         else:
             score -= 10
-    except:
+    except Exception:
         pass
-
-    # 大户多空比
-    if long_ratio > 3:
-        score -= 15
-        reasons.append("多空比极多")
-    elif long_ratio < 0.33:
-        score += 15
-        reasons.append("多空比极空")
 
     # 映射
     if score >= 60:
@@ -192,6 +180,6 @@ def _advice_and_reasons(pct, vol_or_oi, funding_map, long_ratio, price, sym):
         return "反向", reasons
 
 if __name__ == "__main__":
-    logging.info("GitHub Actions 完全扫描开始")
+    logging.info("GitHub Actions 扫描开始")
     run_once()
     logging.info("扫描结束")
