@@ -101,7 +101,7 @@ def run_once():
                     send(msg)
 
         except Exception as e:
-            logging.debug("%s skip %s", sym, e)
+            logging.info("%s 跳过 %s", sym, e)
     save_cache(cache)
 
 # ---------- 建议 ----------
