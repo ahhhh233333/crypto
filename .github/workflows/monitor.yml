@@ -1,0 +1,30 @@
+name: Crypto Monitor (WeCom Only)
+
+# UTC 时间；每天 08:00、12:00、16:00、20:00 各跑一次
+on:
+  schedule:
+    - cron: "0 8,12,16,20 * * *"
+  workflow_dispatch:   # 也可以手动点击 Run workflow
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas requests
+
+      - name: Run monitor
+        env:
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}    # 必填
+          PROXY_URL: ${{ secrets.PROXY_URL }}                    # 可选，如 http://1.2.3.4:8080
+        run: python monitor.py
