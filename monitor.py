@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub Actions 完全版
-保留原始播报格式 + 建议/理由
-已修复 None 异常
+GitHub Actions 终极版（空值安全）
 """
 import os, time, json, logging, requests, math
 import ccxt
@@ -11,8 +9,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 PROXY_URL = os.getenv("PROXY_URL")
 WECOM_URL = os.getenv("WECOM_WEBHOOK_URL")
-if not WECOM_URL:
-    raise RuntimeError("缺少环境变量：WECOM_WEBHOOK_URL")
 proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 spot   = ccxt.binance({'proxies': proxies, 'enableRateLimit': True})
@@ -31,22 +27,17 @@ def send(msg):
         logging.info("推送结果 %s", r.status_code)
     except Exception as e:
         logging.error("推送失败 %s", e)
-
 def fmt(n): return f"{int(n):,}"
 
-# ---------- 手写 RSI ----------
-def rsi(close, period=14):
-    if len(close) < period + 1:
-        return 50
-    gains, losses = [], []
-    for i in range(1, len(close)):
-        diff = close[i] - close[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    rs = avg_gain / (avg_loss + 1e-9)
-    return 100 - (100 / (1 + rs))
+# ---------- 安全获取全局数据 ----------
+def safe_funding_map():
+    try:
+        data = future.fapiPublicGetPremiumIndex()
+        if isinstance(data, list):
+            return {d['symbol']: float(d.get('lastFundingRate', 0)) for d in data}
+    except Exception as e:
+        logging.info("资金费率获取失败 %s", e)
+    return {}
 
 # ---------- 主 ----------
 def run_once():
@@ -55,21 +46,14 @@ def run_once():
     symbols = [s for s in future.load_markets() if s.endswith('/USDT')]
     logging.info("开始扫描 %d 个合约", len(symbols))
 
-    # 全局数据
-    funding_map = {}
-    try:
-        premiums = future.fapiPublicGetPremiumIndex()
-        if premiums:
-            funding_map = {d['symbol']: float(d['lastFundingRate']) for d in premiums}
-    except Exception as e:
-        logging.info("全局数据获取失败 %s", e)
+    funding_map = safe_funding_map()
 
     for sym in symbols:
         try:
             base = sym.split('/')[0]
             spot_sym = f"{base}/USDT"
 
-            # 1) 现货放量
+            # 现货放量
             if spot_sym in spot.symbols:
                 ticker = spot.fetch_ticker(spot_sym)
                 price = float(ticker['last'])
@@ -92,7 +76,7 @@ def run_once():
                                f"理由：{'; '.join(reasons)}")
                         send(msg)
 
-            # 2) 期货 5 min 持仓
+            # 期货 5 min
             oi = float(future.fetch_open_interest(sym)['openInterestAmount'])
             oi_hist = cache.setdefault("oi", {}).setdefault(sym, [])
             oi_hist.append({"ts": now, "oi": oi})
@@ -117,39 +101,18 @@ def run_once():
     save_cache(cache)
 
 # ---------- 建议 ----------
-def _advice(val, change, amount, funding_map, sym):
+def _advice(price, change, amount, funding_map, sym):
     reasons, score = [], 0
     rate = funding_map.get(sym.replace("/", ""), 0) * 100
     if rate <= -0.15:
         score += 30; reasons.append(f"费率恐慌 {rate:.2f}%")
     elif rate >= 0.15:
         score -= 25; reasons.append(f"费率多头 {rate:.2f}%")
-
-    # 简易 MACD 方向（3 根均线）
-    try:
-        k = spot.fetch_ohlcv(f"{sym.split('/')[0]}/USDT", '5m', limit=5)
-        close = [float(x[4]) for x in k]
-        if len(close) >= 3:
-            ma3 = sum(close[-3:]) / 3
-            ma_prev = sum(close[-4:-1]) / 3
-            if ma3 > ma_prev:
-                score += 10
-            else:
-                score -= 10
-    except Exception as e:
-        reasons.append(str(e))
-
-    # 映射
-    if score >= 50:
-        return "抄底", reasons
-    elif score >= 30:
-        return "买入", reasons
-    elif score <= -50:
-        return "逃顶", reasons
-    elif score <= -30:
-        return "卖出", reasons
-    else:
-        return "观望", reasons
+    if score >= 50: return "抄底", reasons
+    elif score >= 30: return "买入", reasons
+    elif score <= -50: return "逃顶", reasons
+    elif score <= -30: return "卖出", reasons
+    else: return "观望", reasons
 
 if __name__ == "__main__":
     logging.info("GitHub Actions 无依赖扫描")
