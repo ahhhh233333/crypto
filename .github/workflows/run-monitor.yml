@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
   schedule:
     # 每 5 分钟执行一次（注意：GitHub Actions 使用 UTC 时区）
-    - cron: "*/5 * * * *"
+  
 
 jobs:
   run:
