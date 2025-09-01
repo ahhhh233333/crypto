@@ -25,15 +25,11 @@
 import os
 import sys
 import time
-import math
-import json
-import hmac
-import hashlib
 import logging
 import threading
 from collections import deque, defaultdict
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, Tuple, List
+from datetime import datetime, timezone
+from typing import Dict, Optional
 
 import requests
 import ccxt
@@ -41,7 +37,7 @@ import ccxt
 
 # ---------------------- 基础配置 ----------------------
 SPOT_CANDIDATES = [
-    "binance",     # 体量最大，优先
+    "binance",
     "okx",
     "bybit",
     "kucoin",
@@ -49,16 +45,16 @@ SPOT_CANDIDATES = [
 
 QUOTE = "USDT"
 SPOT_TIMEFRAME = "1m"
-SPOT_LIMIT = 2  # 仅需最近两根K线（前一根已收盘）
+SPOT_LIMIT = 2
 SPOT_MIN_USD_VALUE = 50_000.0
 SPOT_MIN_MOVE = 0.02  # 2%
 
-FUTURES_OI_WINDOW_MIN = 5          # 5分钟窗口
-FUTURES_OI_MIN_GROWTH = 0.05       # 5%
+FUTURES_OI_WINDOW_MIN = 5
+FUTURES_OI_MIN_GROWTH = 0.05
+
 DEFAULT_LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_SECONDS", "20"))
 SYMBOLS_LIMIT = int(os.getenv("SYMBOLS_LIMIT", "40"))
 
-# 通知限频/去重：同一个 key 在该周期内只发一次（秒）
 DEDUP_TTL_SECONDS = 10 * 60  # 10分钟
 
 
@@ -119,7 +115,6 @@ class Notifier:
             logger.exception(f"Telegram notify exception: {e}")
 
     def notify_all(self, text: str):
-        # 并行发，不阻塞主循环
         threading.Thread(target=self.send_wechat, args=(text,), daemon=True).start()
         threading.Thread(target=self.send_telegram, args=(text,), daemon=True).start()
 
@@ -135,10 +130,8 @@ def estimate_exchange_24h_quote_volume(ex: ccxt.Exchange, quote: str) -> float:
 
     total = 0.0
     for sym, t in tickers.items():
-        # 要求现货对
         if not isinstance(sym, str) or f"/{quote}" not in sym:
             continue
-        # 优先用统一的 quoteVolume，其次 info 字段里的 quoteVolume，再退化用 close*baseVolume
         qv = None
         if isinstance(t, dict):
             qv = safe_float(t.get("quoteVolume"))
@@ -183,10 +176,8 @@ def pick_top_spot_exchange(quote: str = QUOTE) -> ccxt.Exchange:
 # ---------------------- 期货 OI 获取 ----------------------
 def fetch_open_interest_binance(binance_future: ccxt.binance, symbol: str) -> Optional[float]:
     """
-    获取 Binance USDT 永续合约的 OI。
-    多策略尝试，尽量兼容不同版本的 ccxt。
-    返回值：合约张数或币本位数量（Binance返回的 openInterest 单位通常是“张/币”，
-    对于同比例比较（百分比变化）足够使用）
+    获取 Binance USDT 永续合约的 OI，多策略尝试以兼容不同 ccxt 版本。
+    返回值单位（张/币）对“百分比变化”比较足够使用。
     """
     market = binance_future.market(symbol)
     # 1) 统一 API（如果版本支持）
@@ -200,15 +191,13 @@ def fetch_open_interest_binance(binance_future: ccxt.binance, symbol: str) -> Op
     except Exception:
         pass
 
-    # 2) 直接调用 fapi 公共端点
-    # 常见方法名：fapiPublicGetOpenInterest 或者 publicFapiGetOpenInterest
+    # 2) 公共端点兜底
     id_ = market.get("id") or market.get("symbol") or symbol.replace("/", "")
     for method in ("fapiPublicGetOpenInterest", "publicFapiGetOpenInterest", "fapiPublicV1GetOpenInterest"):
         try:
             if hasattr(binance_future, method):
                 fn = getattr(binance_future, method)
                 data = fn({"symbol": id_})
-                # 期望 {'symbol': 'BTCUSDT', 'openInterest': '12345.678', 'time': 169...}
                 if isinstance(data, dict):
                     val = safe_float(data.get("openInterest"))
                     if val is not None:
@@ -230,12 +219,11 @@ class Monitor:
         self.futures = ccxt.binance({
             "enableRateLimit": True,
             "options": {
-                "defaultType": "future",  # USDⓈ-M 永续/交割合约域
+                "defaultType": "future",
                 "adjustForTimeDifference": True,
             }
         })
 
-        # 预加载市场
         self.spot.load_markets()
         self.futures.load_markets()
 
@@ -246,18 +234,14 @@ class Monitor:
         ]
         self.futures_symbols.sort()
 
-        # 将现货市场的可用 symbols 记下，避免后续 fetch_ohlcv 报错
+        # 记录现货可用 symbols，避免 fetch_ohlcv 不支持时报错
         self.spot_symbols = set(self.spot.symbols or [])
-        self.dedup_cache: Dict[str, int] = {}  # 事件去重
-        self.oi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=60))  # 保存 (ts_ms, oi)
+        self.dedup_cache: Dict[str, int] = {}
+        self.oi_history = defaultdict(lambda: deque(maxlen=60))  # symbol -> deque[(ts_ms, oi)]
 
         logger.info(f"Futures symbols (USDT linear) total={len(self.futures_symbols)}; spot={self.spot.id}")
 
     def _dedup(self, key: str) -> bool:
-        """
-        返回 True 表示该 key 在 TTL 内已存在（需要跳过）
-        返回 False 表示可发送并记录
-        """
         now = int(time.time())
         ts = self.dedup_cache.get(key)
         if ts and now - ts < DEDUP_TTL_SECONDS:
@@ -293,9 +277,8 @@ class Monitor:
         )
 
     def check_spot_alert(self, symbol: str):
-        """检查现货 1m K 线是否触发报警"""
         if symbol not in self.spot_symbols:
-            return  # 现货所不支持该交易对，跳过
+            return
 
         try:
             ohlcvs = self.spot.fetch_ohlcv(symbol, timeframe=SPOT_TIMEFRAME, limit=SPOT_LIMIT)
@@ -306,7 +289,6 @@ class Monitor:
         if not ohlcvs or len(ohlcvs) < 2:
             return
 
-        # 最近一根已收盘的K线
         ts, o, h, l, c, vol_base = ohlcvs[-2]
         o = safe_float(o)
         c = safe_float(c)
@@ -315,7 +297,6 @@ class Monitor:
         if not (o and c and vol_base):
             return
 
-        # 以收盘价估算该分钟的美元成交额
         vol_quote = c * vol_base
         move = abs((c - o) / o)
 
@@ -327,7 +308,6 @@ class Monitor:
                 logger.info(f"SPOT ALERT sent: {symbol} {vol_quote:,.0f}USD {move*100:.2f}%")
 
     def check_futures_oi_alert(self, symbol: str):
-        """检查期货 OI 是否在 5 分钟内增长 >= 5%"""
         try:
             oi_now = fetch_open_interest_binance(self.futures, symbol)
         except Exception as e:
@@ -338,10 +318,9 @@ class Monitor:
             return
 
         ts = utcnow_ms()
-        q = self.oi_history[symbol]
+        q: deque = self.oi_history[symbol]
         q.append((ts, oi_now))
 
-        # 找到约 5 分钟前的点
         cutoff = ts - FUTURES_OI_WINDOW_MIN * 60 * 1000
         older = None
         for t0, oi0 in q:
@@ -354,7 +333,6 @@ class Monitor:
         if oi_old:
             growth = (oi_now - oi_old) / oi_old
             if growth >= FUTURES_OI_MIN_GROWTH:
-                # 归一到 5 分钟区间 key
                 window_key = int(cutoff / (FUTURES_OI_WINDOW_MIN * 60 * 1000))
                 key = f"oi:{symbol}:{window_key}"
                 if not self._dedup(key):
@@ -363,13 +341,10 @@ class Monitor:
                     logger.info(f"FUTURES OI ALERT sent: {symbol} +{growth*100:.2f}% in {FUTURES_OI_WINDOW_MIN}m")
 
     def run_once(self):
-        # 限制每轮扫描数量，避免速率过高
         symbols = self.futures_symbols[:SYMBOLS_LIMIT] if SYMBOLS_LIMIT > 0 else self.futures_symbols
         for sym in symbols:
             try:
-                # 现货报警（需要现货所支持相同 symbol）
                 self.check_spot_alert(sym)
-                # 期货 OI 报警
                 self.check_futures_oi_alert(sym)
             except Exception as e:
                 logger.debug(f"run_once symbol {sym} error: {e}")
@@ -383,7 +358,6 @@ class Monitor:
             except Exception as e:
                 logger.exception(f"loop error: {e}")
 
-            # 控制循环频率
             elapsed = time.time() - start
             sleep_sec = max(1.0, DEFAULT_LOOP_INTERVAL - elapsed)
             time.sleep(sleep_sec)
