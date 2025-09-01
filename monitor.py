@@ -1,79 +1,56 @@
 #!/usr/bin/env python3
 """
-GitHub Actions 终极版（pandas-ta 版，无需 TA-Lib）
-保留原始播报格式，末尾追加「建议 + 理由」
+GitHub Actions 完全版（无外部指标库）
+保留原始播报格式 + 建议/理由
 """
-import os
-import time
-import json
-import logging
-import requests
-import pandas as pd
-import pandas_ta as ta
+import os, time, json, logging, requests, math
 import ccxt
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
-# ---------- 代理 ----------
 PROXY_URL = os.getenv("PROXY_URL")
 WECOM_URL = os.getenv("WECOM_WEBHOOK_URL")
-if not WECOM_URL:
-    raise RuntimeError("缺少环境变量：WECOM_WEBHOOK_URL")
 proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
-# ---------- 交易所 ----------
-spot_exchange   = ccxt.binance({'proxies': proxies, 'enableRateLimit': True})
-future_exchange = ccxt.binance({'options': {'defaultType': 'future'},
-                                'proxies': proxies, 'enableRateLimit': True})
+spot   = ccxt.binance({'proxies': proxies, 'enableRateLimit': True})
+future = ccxt.binance({'options': {'defaultType': 'future'},
+                       'proxies': proxies, 'enableRateLimit': True})
 
 CACHE_FILE = "cache.json"
-
-# ---------- 缓存 ----------
 def load_cache():
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_cache(data):
-    with open(CACHE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-# ---------- 发送 ----------
+    return json.load(open(CACHE_FILE)) if os.path.exists(CACHE_FILE) else {}
+def save_cache(d):
+    json.dump(d, open(CACHE_FILE, "w"), indent=2)
 def send(msg):
-    try:
-        r = requests.post(WECOM_URL,
-                          json={"msgtype": "text", "text": {"content": msg}},
-                          proxies=proxies, timeout=10)
-        logging.info("推送结果 %s", r.status_code)
-    except Exception as e:
-        logging.error("推送失败 %s", e)
+    requests.post(WECOM_URL, json={"msgtype":"text","text":{"content":msg}},
+                  proxies=proxies, timeout=10)
 
-# ---------- 技术指标 ----------
+def fmt(n): return f"{int(n):,}"
+
+# ---------- 手写 RSI ----------
 def rsi(close, period=14):
-    return float(pd.Series(close).ta.rsi(length=period).iloc[-1])
-
-def macd(close):
-    df = pd.Series(close).ta.macd()
-    return float(df["MACD_12_26_9"].iloc[-1]), float(df["MACDs_12_26_9"].iloc[-1])
-
-def fmt(num):
-    return f"{int(num):,}"
+    gains, losses = [], []
+    for i in range(1, len(close)):
+        diff = close[i] - close[i-1]
+        gains.append(diff if diff > 0 else 0)
+        losses.append(-diff if diff < 0 else 0)
+    if len(gains) < period: return 50
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    rs = avg_gain / max(avg_loss, 1e-9)
+    return 100 - (100 / (1 + rs))
 
 # ---------- 主 ----------
 def run_once():
     now = int(time.time())
     cache = load_cache()
-
-    symbols = [s for s in future_exchange.load_markets() if s.endswith('/USDT')]
+    symbols = [s for s in future.load_markets() if s.endswith('/USDT')]
     logging.info("开始扫描 %d 个合约", len(symbols))
 
-    # 全局附加数据
     try:
-        premiums = future_exchange.fapiPublicGetPremiumIndex()
+        premiums = future.fapiPublicGetPremiumIndex()
         funding_map = {d['symbol']: float(d['lastFundingRate']) for d in premiums}
-    except Exception:
+    except:
         funding_map = {}
 
     for sym in symbols:
@@ -81,9 +58,9 @@ def run_once():
             base = sym.split('/')[0]
             spot_sym = f"{base}/USDT"
 
-            # ---- 现货 1 min 放量 ----
-            if spot_sym in spot_exchange.symbols:
-                ticker = spot_exchange.fetch_ticker(spot_sym)
+            # ---- 现货 1 min ----
+            if spot_sym in spot.symbols:
+                ticker = spot.fetch_ticker(spot_sym)
                 price = float(ticker['last'])
                 vol1m = float(ticker['quoteVolume']) / (24 * 60)
 
@@ -93,11 +70,10 @@ def run_once():
                 cache["spot"][spot_sym] = spot_hist
 
                 if len(spot_hist) >= 2:
-                    prev_price = spot_hist[-2]["price"]
-                    pct = (price - prev_price) / prev_price * 100
+                    prev = spot_hist[-2]["price"]
+                    pct = (price - prev) / prev * 100
                     if vol1m >= 50000 and abs(pct) >= 2:
-                        advice, reasons = _advice_and_reasons(
-                            pct, vol1m, funding_map, price, spot_sym)
+                        advice, reasons = _advice(price, pct, vol1m, funding_map, sym)
                         msg = (f"警报：{spot_sym}\n"
                                f"类型：现货放量\n"
                                f"数据：1 分钟成交额: ${fmt(vol1m)}, 价格波动: {pct:.2f}%\n"
@@ -105,8 +81,8 @@ def run_once():
                                f"理由：{'; '.join(reasons)}")
                         send(msg)
 
-            # ---- 期货 5 min 加仓 ----
-            oi = float(future_exchange.fetch_open_interest(sym)['openInterestAmount'])
+            # ---- 期货 5 min ----
+            oi = float(future.fetch_open_interest(sym)['openInterestAmount'])
             oi_hist = cache.setdefault("oi", {}).setdefault(sym, [])
             oi_hist.append({"ts": now, "oi": oi})
             oi_hist = [x for x in oi_hist if now - x["ts"] <= 300]
@@ -116,8 +92,7 @@ def run_once():
                 prev_oi = oi_hist[0]["oi"]
                 delta = (oi - prev_oi) / prev_oi * 100
                 if abs(delta) >= 5:
-                    advice, reasons = _advice_and_reasons(
-                        delta, oi, funding_map, price, sym)
+                    advice, reasons = _advice(oi, delta, oi, funding_map, sym)
                     msg = (f"警报：{sym}\n"
                            f"类型：期货{'加仓' if delta>0 else '减仓'}\n"
                            f"数据：持仓增加: {delta:.2f}%, 当前持仓: {fmt(oi)}\n"
@@ -126,60 +101,39 @@ def run_once():
                     send(msg)
 
         except Exception as e:
-            logging.debug("%s 跳过 %s", sym, e)
-
+            logging.debug("%s skip %s", sym, e)
     save_cache(cache)
 
-# ---------- 评分 ----------
-def _advice_and_reasons(change, amount, funding_map, price, sym):
+# ---------- 建议 ----------
+def _advice(val, change, amount, funding_map, sym):
     reasons = []
     score = 0
-
-    # 资金费率
     rate = funding_map.get(sym.replace("/", ""), 0) * 100
     if rate <= -0.15:
-        score += 30
-        reasons.append(f"费率恐慌 {rate:.2f}%")
+        score += 30; reasons.append(f"费率恐慌 {rate:.2f}%")
     elif rate >= 0.15:
-        score -= 25
-        reasons.append(f"费率多头 {rate:.2f}%")
-
-    # 技术指标
+        score -= 25; reasons.append(f"费率多头 {rate:.2f}%")
+    # 简易 MACD 方向（用最近 3 根 kline）
     try:
-        k = spot_exchange.fetch_ohlcv(f"{sym.split('/')[0]}/USDT", '5m', limit=20)
+        k = spot.fetch_ohlcv(f"{sym.split('/')[0]}/USDT", '5m', limit=5)
         close = [float(x[4]) for x in k]
-        rsi14 = rsi(close)
-        macd_val, macd_sig = macd(close)
-
-        if rsi14 <= 30:
-            score += 20
-            reasons.append(f"RSI{rsi14:.0f}")
-        elif rsi14 >= 70:
-            score -= 20
-            reasons.append(f"RSI{rsi14:.0f}")
-
-        if macd_val > macd_sig:
-            score += 10
-        else:
-            score -= 10
-    except Exception:
+        if len(close) >= 3:
+            ma3 = sum(close[-3:]) / 3
+            ma_prev = sum(close[-4:-1]) / 3
+            if ma3 > ma_prev:
+                score += 10
+            else:
+                score -= 10
+    except:
         pass
-
     # 映射
-    if score >= 60:
-        return "抄底", reasons
-    elif score >= 40:
-        return "买入", reasons
-    elif score <= -60:
-        return "逃顶", reasons
-    elif score <= -40:
-        return "卖出", reasons
-    elif abs(score) <= 20:
-        return "观望", reasons
-    else:
-        return "反向", reasons
+    if score >= 50: return "抄底", reasons
+    elif score >= 30: return "买入", reasons
+    elif score <= -50: return "逃顶", reasons
+    elif score <= -30: return "卖出", reasons
+    else: return "观望", reasons
 
 if __name__ == "__main__":
-    logging.info("GitHub Actions 扫描开始")
+    logging.info("GitHub Actions 无依赖扫描")
     run_once()
     logging.info("扫描结束")
