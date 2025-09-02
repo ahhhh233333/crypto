@@ -1,454 +1,362 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-加密货币现货和期货监控系统
-监控Binance期货代币的现货和期货交易数据，实现短线交易提醒
+加密货币监控系统
+监控主要加密货币的价格变化，并记录显著波动
 """
 
 import ccxt
 import time
 import logging
+import signal
+import sys
 import os
-import requests
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
 import json
-from datetime import datetime, timedelta
-from collections import defaultdict
-import traceback
-import numpy as np
-import pandas as pd
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('crypto_monitor.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# 加载环境变量
+load_dotenv()
 
 class CryptoMonitor:
+    """加密货币监控类"""
+    
     def __init__(self):
         """初始化监控系统"""
-        # 获取环境变量
-        self.wecom_webhook_url = os.getenv('WECOM_WEBHOOK_URL')
+        # 设置日志
+        self._setup_logging()
         
-        if not self.wecom_webhook_url:
-            logger.warning("警告: 未设置企业微信Webhook URL (WECOM_WEBHOOK_URL)")
+        # 初始化配置
+        self.config = self._load_config()
         
-        # 初始化交易所实例
-        self.exchanges = {
-            'binance': ccxt.binance({'enableRateLimit': True}),
-            'bybit': ccxt.bybit({'enableRateLimit': True}),
-            'okx': ccxt.okx({'enableRateLimit': True}),
-            'bitget': ccxt.bitget({'enableRateLimit': True}),
-            'mexc': ccxt.mexc({'enableRateLimit': True}),
-            'gate': ccxt.gate({'enableRateLimit': True}),
-            'kucoin': ccxt.kucoin({'enableRateLimit': True})
+        # 初始化交易所
+        self.exchanges = self._initialize_exchanges()
+        
+        # 监控状态
+        self.running = True
+        self.last_prices = {}
+        
+        # 注册信号处理
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        self.logger.info("加密货币监控系统初始化完成")
+    
+    def _setup_logging(self):
+        """设置日志系统"""
+        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+        log_file = os.getenv('LOG_FILE', 'crypto_monitor.log')
+        
+        # 创建日志格式
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # 设置根日志器
+        self.logger = logging.getLogger('CryptoMonitor')
+        self.logger.setLevel(getattr(logging, log_level, logging.INFO))
+        
+        # 清除现有处理器
+        self.logger.handlers.clear()
+        
+        # 文件处理器
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
+        
+        # 控制台处理器
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+        
+        # 防止日志重复
+        self.logger.propagate = False
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """加载配置"""
+        return {
+            'monitor_interval': float(os.getenv('MONITOR_INTERVAL', '60')),
+            'price_change_threshold': float(os.getenv('PRICE_CHANGE_THRESHOLD', '5.0')),
+            'max_symbols': int(os.getenv('MAX_SYMBOLS', '50')),
+            'binance_api_key': os.getenv('BINANCE_API_KEY', ''),
+            'binance_secret': os.getenv('BINANCE_SECRET', ''),
         }
+    
+    def _initialize_exchanges(self) -> Dict[str, ccxt.Exchange]:
+        """初始化交易所连接"""
+        exchanges = {}
         
-        # Binance期货专用实例
-        self.binance_futures = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'future'
-            }
-        })
-        
-        # 历史数据存储
-        self.historical_data = defaultdict(lambda: {
-            'prices': [],
-            'volumes': [],
-            'open_interests': [],
-            'timestamps': [],
-            'rsi': [],
-            'ma_short': [],
-            'ma_long': []
-        })
-        
-        # 期货代币列表
-        self.futures_symbols = []
-        
-        # 最大历史记录数
-        self.max_history = 60  # 保存60分钟的数据
-        
-        # 上次警报时间记录（避免重复警报）
-        self.last_alert_time = defaultdict(lambda: datetime.min)
-        self.alert_cooldown = 300  # 5分钟冷却时间
-        
-    def initialize_futures_symbols(self):
-        """获取Binance期货所有USDT交易对"""
         try:
-            logger.info("正在获取Binance期货代币列表...")
-            markets = self.binance_futures.load_markets()
-            
-            self.futures_symbols = [
-                symbol for symbol in markets
-                if symbol.endswith('/USDT') and 
-                markets[symbol].get('type') == 'future' and
-                markets[symbol].get('active', True)
-            ]
-            
-            logger.info(f"找到 {len(self.futures_symbols)} 个期货交易对")
-            return True
-            
-        except Exception as e:
-            logger.error(f"获取期货代币列表失败: {e}")
-            return False
-    
-    def find_best_spot_exchange(self, base_symbol):
-        """找出指定代币成交额最大的现货交易所"""
-        best_exchange = None
-        max_volume = 0
-        symbol = f"{base_symbol}/USDT"
-        
-        for name, exchange in self.exchanges.items():
-            try:
-                # 检查交易所是否支持该交易对
-                if not hasattr(exchange, 'has') or not exchange.has.get('fetchTicker', True):
-                    continue
-                
-                # 加载市场信息
-                if not exchange.markets:
-                    exchange.load_markets()
-                
-                if symbol not in exchange.markets:
-                    continue
-                
-                # 获取24小时成交数据
-                ticker = exchange.fetch_ticker(symbol)
-                quote_volume = ticker.get('quoteVolume', 0) or 0
-                
-                if quote_volume > max_volume:
-                    max_volume = quote_volume
-                    best_exchange = name
-                    
-                time.sleep(0.1)  # 避免请求过快
-                
-            except Exception as e:
-                logger.debug(f"获取 {name} 的 {symbol} 数据失败: {e}")
-                continue
-        
-        return best_exchange, max_volume
-    
-    def calculate_rsi(self, prices, period=14):
-        """计算RSI指标"""
-        if len(prices) < period + 1:
-            return None
-        
-        prices_array = np.array(prices[-period-1:])
-        deltas = np.diff(prices_array)
-        seed = deltas[:period]
-        up = seed[seed >= 0].sum() / period
-        down = -seed[seed < 0].sum() / period
-        
-        if down == 0:
-            return 100
-        
-        rs = up / down
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-    
-    def calculate_ma(self, prices, period):
-        """计算移动平均线"""
-        if len(prices) < period:
-            return None
-        return np.mean(prices[-period:])
-    
-    def get_trading_signal(self, symbol_data):
-        """根据技术指标生成交易信号"""
-        signals = []
-        strength = 0  # 信号强度 -100 到 100
-        
-        # 获取最新数据
-        if len(symbol_data['prices']) < 20:
-            return "数据不足", 0
-        
-        current_price = symbol_data['prices'][-1]
-        rsi = symbol_data['rsi'][-1] if symbol_data['rsi'] else None
-        ma_short = symbol_data['ma_short'][-1] if symbol_data['ma_short'] else None
-        ma_long = symbol_data['ma_long'][-1] if symbol_data['ma_long'] else None
-        
-        # RSI信号
-        if rsi:
-            if rsi < 30:
-                signals.append("RSI超卖")
-                strength += 30
-            elif rsi > 70:
-                signals.append("RSI超买")
-                strength -= 30
-            elif 30 <= rsi <= 40:
-                signals.append("RSI偏低")
-                strength += 15
-            elif 60 <= rsi <= 70:
-                signals.append("RSI偏高")
-                strength -= 15
-        
-        # 均线信号
-        if ma_short and ma_long:
-            if ma_short > ma_long and current_price > ma_short:
-                signals.append("均线多头")
-                strength += 25
-            elif ma_short < ma_long and current_price < ma_short:
-                signals.append("均线空头")
-                strength -= 25
-        
-        # 价格动量
-        if len(symbol_data['prices']) >= 5:
-            price_5min_ago = symbol_data['prices'][-5]
-            price_change = (current_price - price_5min_ago) / price_5min_ago * 100
-            
-            if price_change > 3:
-                signals.append("强势上涨")
-                strength += 20
-            elif price_change < -3:
-                signals.append("强势下跌")
-                strength -= 20
-        
-        # 持仓量变化
-        if len(symbol_data['open_interests']) >= 5:
-            oi_current = symbol_data['open_interests'][-1]
-            oi_5min_ago = symbol_data['open_interests'][-5]
-            
-            if oi_5min_ago > 0:
-                oi_change = (oi_current - oi_5min_ago) / oi_5min_ago * 100
-                
-                if oi_change > 5:
-                    if strength > 0:
-                        signals.append("持仓增加-看多")
-                        strength += 15
-                    else:
-                        signals.append("持仓增加-逼空")
-                        strength -= 10
-                elif oi_change < -5:
-                    signals.append("持仓减少")
-                    strength = strength * 0.7  # 减弱信号
-        
-        # 生成建议
-        if strength >= 40:
-            action = "强烈买入"
-        elif strength >= 20:
-            action = "买入"
-        elif strength >= 10:
-            action = "轻仓买入"
-        elif strength <= -40:
-            action = "强烈卖出"
-        elif strength <= -20:
-            action = "卖出"
-        elif strength <= -10:
-            action = "轻仓卖出"
-        else:
-            action = "观望"
-        
-        reason = f"信号强度:{strength}, 指标:{', '.join(signals) if signals else '无明显信号'}"
-        
-        return action, strength, reason
-    
-    def monitor_symbol(self, symbol):
-        """监控单个交易对"""
-        try:
-            base = symbol.split('/')[0]
-            
-            # 找出最佳现货交易所
-            best_exchange, daily_volume = self.find_best_spot_exchange(base)
-            
-            if not best_exchange:
-                logger.debug(f"{symbol} 未找到可用的现货交易所")
-                return
-            
-            spot_exchange = self.exchanges[best_exchange]
-            
-            # 获取现货数据
-            spot_ticker = spot_exchange.fetch_ticker(symbol)
-            current_price = spot_ticker['last']
-            
-            # 获取1分钟K线数据计算成交额
-            try:
-                ohlcv = spot_exchange.fetch_ohlcv(symbol, '1m', limit=2)
-                if len(ohlcv) >= 1:
-                    # 最新的1分钟成交额
-                    minute_volume = ohlcv[-1][5] * ohlcv[-1][4]  # volume * close
-                else:
-                    minute_volume = 0
-            except:
-                minute_volume = 0
-            
-            # 获取期货持仓量
-            try:
-                open_interest_data = self.binance_futures.fetch_open_interest(symbol)
-                open_interest = open_interest_data.get('openInterestAmount', 0)
-            except:
-                open_interest = 0
-            
-            # 更新历史数据
-            data = self.historical_data[symbol]
-            data['prices'].append(current_price)
-            data['volumes'].append(minute_volume)
-            data['open_interests'].append(open_interest)
-            data['timestamps'].append(datetime.now())
-            
-            # 计算技术指标
-            if len(data['prices']) >= 14:
-                rsi = self.calculate_rsi(data['prices'])
-                data['rsi'].append(rsi)
-            else:
-                data['rsi'].append(None)
-            
-            ma_short = self.calculate_ma(data['prices'], 7)
-            ma_long = self.calculate_ma(data['prices'], 21)
-            data['ma_short'].append(ma_short)
-            data['ma_long'].append(ma_long)
-            
-            # 限制历史数据长度
-            for key in data:
-                if len(data[key]) > self.max_history:
-                    data[key] = data[key][-self.max_history:]
-            
-            # 检查是否需要发送警报
-            alerts = []
-            
-            # 现货放量检查
-            if minute_volume > 50000 and len(data['prices']) >= 2:
-                price_change = (current_price - data['prices'][-2]) / data['prices'][-2] * 100
-                
-                if abs(price_change) > 2:
-                    action, strength, reason = self.get_trading_signal(data)
-                    
-                    alert_msg = f"""🔔 现货放量警报
-代币: {symbol}
-交易所: {best_exchange}
-当前价格: ${current_price:.4f}
-1分钟成交额: ${minute_volume:,.0f}
-价格波动: {price_change:+.2f}%
-RSI: {data['rsi'][-1]:.1f if data['rsi'][-1] else 'N/A'}
-建议: {action}
-原因: {reason}"""
-                    alerts.append(alert_msg)
-            
-            # 期货持仓检查
-            if len(data['open_interests']) >= 5 and data['open_interests'][-5] > 0:
-                oi_change = (open_interest - data['open_interests'][-5]) / data['open_interests'][-5] * 100
-                
-                if oi_change > 5:
-                    action, strength, reason = self.get_trading_signal(data)
-                    
-                    alert_msg = f"""📈 期货加仓警报
-代币: {symbol}
-当前价格: ${current_price:.4f}
-持仓增加: {oi_change:+.2f}%
-当前持仓: ${open_interest:,.0f}
-RSI: {data['rsi'][-1]:.1f if data['rsi'][-1] else 'N/A'}
-建议: {action}
-原因: {reason}"""
-                    alerts.append(alert_msg)
-            
-            # 发送警报
-            for alert in alerts:
-                if self.check_alert_cooldown(symbol):
-                    self.send_alert(alert)
-                    logger.info(f"发送警报: {symbol}")
-            
-        except Exception as e:
-            logger.error(f"监控 {symbol} 失败: {e}")
-            logger.debug(traceback.format_exc())
-    
-    def check_alert_cooldown(self, symbol):
-        """检查是否在冷却时间内"""
-        now = datetime.now()
-        last_alert = self.last_alert_time[symbol]
-        
-        if (now - last_alert).total_seconds() > self.alert_cooldown:
-            self.last_alert_time[symbol] = now
-            return True
-        return False
-    
-    def send_alert(self, message):
-        """发送警报到企业微信"""
-        try:
-            # 发送到企业微信
-            if self.wecom_webhook_url:
-                self.send_to_wecom(message)
-            else:
-                logger.warning("未配置企业微信，警报仅记录到日志")
-                logger.info(f"警报内容:\n{message}")
-                
-        except Exception as e:
-            logger.error(f"发送警报失败: {e}")
-    
-    def send_to_wecom(self, message):
-        """发送消息到企业微信"""
-        try:
-            data = {
-                "msgtype": "text",
-                "text": {
-                    "content": message
+            # 初始化Binance交易所
+            binance_config = {
+                'apiKey': self.config['binance_api_key'],
+                'secret': self.config['binance_secret'],
+                'sandbox': False,
+                'enableRateLimit': True,
+                'timeout': 30000,
+                'options': {
+                    'adjustForTimeDifference': True,
                 }
             }
             
-            response = requests.post(
-                self.wecom_webhook_url,
-                json=data,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
+            # 如果没有API密钥，移除认证信息
+            if not self.config['binance_api_key']:
+                binance_config.pop('apiKey', None)
+                binance_config.pop('secret', None)
             
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('errcode') == 0:
-                    logger.info("企业微信消息发送成功")
-                else:
-                    logger.error(f"企业微信消息发送失败: {result}")
-            else:
-                logger.error(f"企业微信请求失败: {response.status_code}")
-                
+            binance = ccxt.binance(binance_config)
+            exchanges['binance'] = binance
+            
+            self.logger.info("Binance交易所初始化成功")
+            
         except Exception as e:
-            logger.error(f"发送企业微信消息异常: {e}")
+            self.logger.error(f"初始化Binance交易所失败: {e}")
+            
+        return exchanges
     
-    def run(self):
-        """主运行循环"""
-        logger.info("加密货币监控系统启动")
+    def get_trading_symbols(self, exchange_name: str = 'binance') -> List[str]:
+        """获取交易对列表"""
+        if exchange_name not in self.exchanges:
+            self.logger.error(f"交易所 {exchange_name} 未初始化")
+            return []
         
-        # 初始化期货代币列表
-        if not self.initialize_futures_symbols():
-            logger.error("无法获取期货代币列表，程序退出")
+        exchange = self.exchanges[exchange_name]
+        
+        try:
+            self.logger.info(f"正在获取{exchange_name.title()}交易对列表...")
+            
+            # 加载市场数据
+            markets = exchange.load_markets()
+            
+            # 获取所有USDT交易对
+            usdt_symbols = []
+            for symbol, market in markets.items():
+                # 过滤条件：活跃的USDT交易对
+                if (market.get('active', True) and 
+                    symbol.endswith('/USDT') and
+                    market.get('type') in ['spot', 'future', None]):
+                    usdt_symbols.append(symbol)
+            
+            # 如果仍然没有找到交易对，使用备选方案
+            if not usdt_symbols:
+                self.logger.warning("未找到USDT交易对，使用备选交易对列表")
+                usdt_symbols = [
+                    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'XRP/USDT',
+                    'SOL/USDT', 'DOT/USDT', 'DOGE/USDT', 'AVAX/USDT', 'MATIC/USDT',
+                    'LINK/USDT', 'UNI/USDT', 'LTC/USDT', 'BCH/USDT', 'ATOM/USDT'
+                ]
+            
+            # 按交易量排序并限制数量
+            if len(usdt_symbols) > self.config['max_symbols']:
+                try:
+                    # 获取24小时统计数据
+                    tickers = exchange.fetch_tickers(usdt_symbols[:100])
+                    
+                    # 按交易量排序
+                    sorted_symbols = sorted(
+                        tickers.keys(),
+                        key=lambda x: float(tickers[x].get('quoteVolume') or 0),
+                        reverse=True
+                    )[:self.config['max_symbols']]
+                    
+                    usdt_symbols = sorted_symbols
+                    self.logger.info(f"按交易量排序，选择前{self.config['max_symbols']}个交易对")
+                    
+                except Exception as e:
+                    self.logger.warning(f"无法获取交易量数据进行排序: {e}")
+                    usdt_symbols = usdt_symbols[:self.config['max_symbols']]
+            
+            self.logger.info(f"找到 {len(usdt_symbols)} 个交易对")
+            
+            # 显示前10个交易对作为示例
+            if usdt_symbols:
+                sample_symbols = usdt_symbols[:10]
+                self.logger.info(f"示例交易对: {', '.join(sample_symbols)}")
+            
+            return usdt_symbols
+            
+        except Exception as e:
+            self.logger.error(f"获取交易对失败: {e}")
+            # 返回备选交易对
+            fallback_symbols = [
+                'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'XRP/USDT',
+                'SOL/USDT', 'DOT/USDT', 'DOGE/USDT', 'AVAX/USDT', 'MATIC/USDT'
+            ]
+            self.logger.info(f"使用备选交易对: {len(fallback_symbols)} 个")
+            return fallback_symbols
+    
+    def fetch_ticker_data(self, symbol: str, exchange_name: str = 'binance') -> Optional[Dict[str, Any]]:
+        """获取单个交易对的行情数据"""
+        if exchange_name not in self.exchanges:
+            return None
+        
+        exchange = self.exchanges[exchange_name]
+        
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            
+            return {
+                'symbol': symbol,
+                'price': float(ticker.get('last', 0)),
+                'change': float(ticker.get('percentage', 0)),
+                'volume': float(ticker.get('quoteVolume', 0)),
+                'high': float(ticker.get('high', 0)),
+                'low': float(ticker.get('low', 0)),
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            self.logger.debug(f"获取 {symbol} 行情数据失败: {e}")
+            return None
+    
+    def analyze_price_change(self, symbol: str, current_data: Dict[str, Any]) -> Dict[str, Any]:
+        """分析价格变化"""
+        analysis = {
+            'symbol': symbol,
+            'current_price': current_data['price'],
+            'change_24h': current_data['change'],
+            'is_significant': False,
+            'trend': 'stable'
+        }
+        
+        # 检查是否为显著变化
+        if abs(current_data['change']) >= self.config['price_change_threshold']:
+            analysis['is_significant'] = True
+            analysis['trend'] = 'up' if current_data['change'] > 0 else 'down'
+        
+        # 与上次价格比较（如果有的话）
+        if symbol in self.last_prices:
+            last_price = self.last_prices[symbol]
+            price_diff = ((current_data['price'] - last_price) / last_price) * 100
+            analysis['price_diff_from_last'] = price_diff
+        
+        # 更新最后价格
+        self.last_prices[symbol] = current_data['price']
+        
+        return analysis
+    
+    def log_price_update(self, analysis: Dict[str, Any]):
+        """记录价格更新"""
+        symbol = analysis['symbol']
+        price = analysis['current_price']
+        change_24h = analysis['change_24h']
+        
+        # 格式化价格显示
+        if price >= 1:
+            price_str = f"${price:.4f}"
+        else:
+            price_str = f"${price:.8f}"
+        
+        # 根据变化幅度选择日志级别和图标
+        if analysis['is_significant']:
+            if analysis['trend'] == 'up':
+                icon = "🚀"
+                level = logging.INFO
+            else:
+                icon = "📉"
+                level = logging.INFO
+        else:
+            icon = "📊"
+            level = logging.DEBUG
+        
+        # 构建日志消息
+        message = f"{icon} {symbol}: {price_str} ({change_24h:+.2f}%)"
+        
+        # 添加额外信息
+        if 'price_diff_from_last' in analysis:
+            diff = analysis['price_diff_from_last']
+            if abs(diff) > 0.1:  # 只显示显著的短期变化
+                message += f" [短期: {diff:+.2f}%]"
+        
+        self.logger.log(level, message)
+    
+    def monitor_prices(self, symbols: List[str]):
+        """监控价格变化"""
+        if not symbols:
+            self.logger.error("没有交易对需要监控")
             return
         
-        # 限制监控数量，避免API超限
-        monitor_symbols = self.futures_symbols[:20]  # 只监控前20个交易对
-        logger.info(f"开始监控 {len(monitor_symbols)} 个交易对")
+        self.logger.info(f"开始监控 {len(symbols)} 个交易对")
         
-        while True:
+        while self.running:
             try:
-                start_time = time.time()
+                successful_updates = 0
                 
-                for symbol in monitor_symbols:
-                    try:
-                        self.monitor_symbol(symbol)
-                        time.sleep(1)  # 每个交易对间隔1秒
-                    except Exception as e:
-                        logger.error(f"监控 {symbol} 时出错: {e}")
-                        continue
+                for symbol in symbols:
+                    if not self.running:
+                        break
+                    
+                    # 获取行情数据
+                    ticker_data = self.fetch_ticker_data(symbol)
+                    
+                    if ticker_data:
+                        # 分析价格变化
+                        analysis = self.analyze_price_change(symbol, ticker_data)
+                        
+                        # 记录价格更新
+                        self.log_price_update(analysis)
+                        
+                        successful_updates += 1
+                    
+                    # 短暂延迟避免请求过于频繁
+                    time.sleep(0.1)
                 
-                # 计算剩余等待时间
-                elapsed_time = time.time() - start_time
-                wait_time = max(60 - elapsed_time, 1)  # 确保至少等待1秒
-                
-                logger.info(f"本轮监控完成，等待 {wait_time:.1f} 秒后继续...")
-                time.sleep(wait_time)
-                
+                if self.running:
+                    self.logger.info(
+                        f"本轮监控完成，成功更新 {successful_updates}/{len(symbols)} 个交易对，"
+                        f"等待 {self.config['monitor_interval']} 秒后继续..."
+                    )
+                    time.sleep(self.config['monitor_interval'])
+                    
             except KeyboardInterrupt:
-                logger.info("收到中断信号，程序退出")
+                self.logger.info("收到键盘中断信号")
                 break
             except Exception as e:
-                logger.error(f"主循环错误: {e}")
-                logger.debug(traceback.format_exc())
-                time.sleep(60)
+                self.logger.error(f"监控过程中发生错误: {e}")
+                time.sleep(10)  # 错误后等待更长时间
+    
+    def _signal_handler(self, signum, frame):
+        """信号处理器"""
+        self.logger.info("收到中断信号，程序退出")
+        self.running = False
+        sys.exit(0)
+    
+    def start(self):
+        """启动监控系统"""
+        self.logger.info("加密货币监控系统启动")
+        
+        # 显示配置信息
+        self.logger.info(f"监控间隔: {self.config['monitor_interval']} 秒")
+        self.logger.info(f"价格变化阈值: {self.config['price_change_threshold']}%")
+        self.logger.info(f"最大监控数量: {self.config['max_symbols']} 个")
+        
+        # 获取交易对列表
+        symbols = self.get_trading_symbols()
+        
+        if not symbols:
+            self.logger.error("无法获取任何交易对，程序退出")
+            return 1
+        
+        # 开始监控
+        try:
+            self.monitor_prices(symbols)
+        except Exception as e:
+            self.logger.error(f"监控系统发生致命错误: {e}")
+            return 1
+        
+        return 0
 
 def main():
     """主函数"""
-    monitor = CryptoMonitor()
-    monitor.run()
+    try:
+        monitor = CryptoMonitor()
+        return monitor.start()
+    except Exception as e:
+        print(f"程序启动失败: {e}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    sys.exit(exit_code)
